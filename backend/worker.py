@@ -19,8 +19,13 @@ async def run_once():
             db.execute("UPDATE extraction_jobs SET status='done',updated_at=? WHERE id=?",(now(),job["id"]))
     return True
 
+def recover_interrupted_jobs():
+    with conn() as db:
+        db.execute("UPDATE extraction_jobs SET status='pending',error='Recovered after restart',updated_at=? WHERE status='running'",(now(),))
+
 async def main():
     init()
+    recover_interrupted_jobs()
     print("AION extraction worker started")
     while True:
         if not await run_once():
