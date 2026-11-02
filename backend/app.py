@@ -38,6 +38,9 @@ def init():
         CREATE TABLE IF NOT EXISTS memories(id TEXT PRIMARY KEY,message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,subject TEXT NOT NULL,predicate TEXT NOT NULL,object TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'candidate',created_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS ix_messages_chat ON messages(chat_id,created_at);
         CREATE INDEX IF NOT EXISTS ix_memories_subject ON memories(subject);
+        CREATE UNIQUE INDEX IF NOT EXISTS ix_memories_unique ON memories(message_id,subject,predicate,object);
+        CREATE TABLE IF NOT EXISTS extraction_jobs(id TEXT PRIMARY KEY,message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,error TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+        CREATE UNIQUE INDEX IF NOT EXISTS ix_extraction_message ON extraction_jobs(message_id);
         """)
 
 @app.on_event("startup")
@@ -77,6 +80,8 @@ def add_message(chat_id:str,body:MessageIn):
     with conn() as db:
         if not db.execute("SELECT 1 FROM chats WHERE id=?",(chat_id,)).fetchone(): raise HTTPException(404,"Chat not found")
         db.execute("INSERT INTO messages VALUES (:id,:chat_id,:role,:content,:created_at)",item)
+        if body.role=="user" and os.getenv("AION_AUTO_EXTRACT","0")=="1":
+            db.execute("INSERT OR IGNORE INTO extraction_jobs VALUES (?,?,?,?,?,?,?)",(uid(),item["id"],"pending",0,None,now(),now()))
     return item
 @app.delete("/api/chats/{chat_id}")
 def delete_chat(chat_id:str):
@@ -89,7 +94,7 @@ def add_memory(body:MemoryIn):
     item={"id":uid(),**body.model_dump(),"status":"candidate","created_at":now()}
     with conn() as db:
         if not db.execute("SELECT 1 FROM messages WHERE id=?",(body.message_id,)).fetchone(): raise HTTPException(404,"Source message not found")
-        db.execute("INSERT INTO memories VALUES (:id,:message_id,:subject,:predicate,:object,:status,:created_at)",item)
+        db.execute("INSERT OR IGNORE INTO memories VALUES (:id,:message_id,:subject,:predicate,:object,:status,:created_at)",item)
     return item
 @app.get("/api/memories")
 def memories(q:str="",limit:int=100):
@@ -239,3 +244,22 @@ def list_backups():
     folder=DB.parent/"backups"
     if not folder.exists(): return []
     return [{"filename":p.name,"size_bytes":p.stat().st_size} for p in sorted(folder.glob("aion-*.sqlite3"),reverse=True)]
+
+@app.get("/api/jobs")
+def jobs(limit:int=100):
+    with conn() as db:
+        return [dict(x) for x in db.execute("SELECT * FROM extraction_jobs ORDER BY created_at DESC LIMIT ?",(min(max(limit,1),500),))]
+
+@app.post("/api/jobs/{job_id}/retry")
+def retry_job(job_id:str):
+    with conn() as db:
+        row=db.execute("UPDATE extraction_jobs SET status='pending',error=NULL,updated_at=? WHERE id=? AND status='failed' RETURNING id",(now(),job_id)).fetchone()
+        if row is None: raise HTTPException(409,"Job not failed or missing")
+    return {"queued":True}
+
+@app.get("/api/knowledge/search")
+def knowledge_search(q:str,limit:int=50):
+    if not q.strip(): return []
+    pattern="%"+q+"%"
+    with conn() as db:
+        return [dict(x) for x in db.execute("SELECT * FROM memories WHERE subject LIKE ? OR predicate LIKE ? OR object LIKE ? ORDER BY CASE status WHEN 'confirmed' THEN 0 ELSE 1 END,created_at DESC LIMIT ?",(pattern,pattern,pattern,min(max(limit,1),100)))]
