@@ -15,6 +15,7 @@ if errorlevel 1 (popd & echo npm install failed & pause & exit /b 1)
 start "AION UI" cmd /k "npm.cmd run dev"
 popd
 start "AION API" cmd /k ".venv\Scripts\python.exe -m uvicorn backend.app:app --host 127.0.0.1 --port 8000"
+if /I "%AION_AUTO_EXTRACT%"=="1" start "AION Worker" cmd /k ".venv\Scripts\python.exe -m backend.worker"
 timeout /t 4 >nul
 start "" "http://127.0.0.1:5173"
 echo AION MEMORY started. Close API and UI windows to stop.
