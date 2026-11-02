@@ -12,7 +12,7 @@ load_dotenv()
 DB = Path(os.getenv("AION_DB_PATH", "data/aion.sqlite3"))
 app = FastAPI(title="AION MEMORY", version="0.1.0")
 origins = os.getenv("AION_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET","POST","DELETE"], allow_headers=["Content-Type"])
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET","POST","PATCH","DELETE"], allow_headers=["Content-Type"])
 
 @contextmanager
 def conn():
