@@ -140,3 +140,102 @@ async def ask(body:AskIn):
     add_message(body.chat_id,MessageIn(role="user",content=body.prompt))
     add_message(body.chat_id,MessageIn(role="assistant",content=answer))
     return {"answer":answer}
+
+
+# Memory operations: explicit review, safe export/import and SQLite-consistent backups.
+from typing import Literal
+from fastapi.responses import Response
+import io
+import zipfile
+import hashlib
+
+class ReviewIn(BaseModel):
+    status: Literal["confirmed","rejected","candidate"]
+
+class ImportIn(BaseModel):
+    title: str = Field(min_length=1,max_length=200)
+    messages: list[MessageIn] = Field(min_length=1,max_length=10000)
+
+class ExtractionIn(BaseModel):
+    message_id: str
+
+@app.patch("/api/memories/{memory_id}")
+def review_memory(memory_id: str, body: ReviewIn):
+    with conn() as db:
+        row=db.execute("UPDATE memories SET status=? WHERE id=? RETURNING *",(body.status,memory_id)).fetchone()
+        if row is None: raise HTTPException(404,"Memory not found")
+        return dict(row)
+
+@app.delete("/api/memories/{memory_id}")
+def delete_memory(memory_id: str):
+    with conn() as db:
+        cur=db.execute("DELETE FROM memories WHERE id=?",(memory_id,))
+        if not cur.rowcount: raise HTTPException(404,"Memory not found")
+    return {"deleted":True}
+
+@app.post("/api/import")
+def import_chat(body: ImportIn):
+    chat={"id":uid(),"title":body.title,"created_at":now()}
+    with conn() as db:
+        db.execute("INSERT INTO chats VALUES (:id,:title,:created_at)",chat)
+        for msg in body.messages:
+            db.execute("INSERT INTO messages VALUES (?,?,?,?,?)",(uid(),chat["id"],msg.role,msg.content,now()))
+    return {"chat_id":chat["id"],"imported":len(body.messages)}
+
+@app.get("/api/chats/{chat_id}/export")
+def export_chat(chat_id: str):
+    with conn() as db:
+        row=db.execute("SELECT * FROM chats WHERE id=?",(chat_id,)).fetchone()
+        if row is None: raise HTTPException(404,"Chat not found")
+        items=[dict(m) for m in db.execute("SELECT * FROM messages WHERE chat_id=? ORDER BY created_at,id",(chat_id,))]
+    payload=json.dumps({"format":"aion-chat-v1","chat":dict(row),"messages":items},ensure_ascii=False,indent=2)
+    return Response(content=payload,media_type="application/json",headers={"Content-Disposition":f'attachment; filename="aion-chat-{chat_id}.json"'})
+
+@app.post("/api/memories/extract")
+async def extract_memory(body: ExtractionIn):
+    """Model-assisted extraction; never confirms model output automatically."""
+    base=os.getenv("AION_CLOUD_BASE_URL","").rstrip("/")
+    key=os.getenv("AION_CLOUD_API_KEY","")
+    model=os.getenv("AION_CLOUD_MODEL","")
+    if not (base and key and model): raise HTTPException(503,"Cloud model not configured")
+    if not base.startswith("https://"): raise HTTPException(400,"HTTPS required")
+    with conn() as db:
+        msg=db.execute("SELECT * FROM messages WHERE id=?",(body.message_id,)).fetchone()
+        if msg is None: raise HTTPException(404,"Source message not found")
+        content=msg["content"]
+    prompt="Extract up to 10 explicit factual triples from this text. Return ONLY a JSON array of objects with keys subject,predicate,object. Do not infer unstated facts. Text follows:\\n"+content
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response=await client.post(base+"/chat/completions",headers={"Authorization":"Bearer "+key},json={"model":model,"messages":[{"role":"user","content":prompt}]})
+            response.raise_for_status()
+            raw=response.json()["choices"][0]["message"]["content"]
+            triples=json.loads(raw)
+    except (httpx.HTTPError,KeyError,IndexError,ValueError,TypeError) as exc:
+        raise HTTPException(502,"Extraction provider returned an invalid response") from exc
+    if not isinstance(triples,list): raise HTTPException(502,"Expected JSON array")
+    created=[]
+    for triple in triples[:10]:
+        if not isinstance(triple,dict): continue
+        try:
+            item=MemoryIn(message_id=body.message_id,subject=triple["subject"],predicate=triple["predicate"],object=triple["object"])
+        except (KeyError,ValueError,TypeError): continue
+        created.append(add_memory(item))
+    return {"candidates":created,"requires_review":True}
+
+@app.post("/api/backups")
+def create_backup():
+    """Local-only SQLite online backup; not exposed as a downloadable public endpoint."""
+    folder=DB.parent/"backups"
+    folder.mkdir(parents=True,exist_ok=True)
+    target=folder/("aion-"+datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S")+"-"+uid()[:8]+".sqlite3")
+    with conn() as db:
+        destination=sqlite3.connect(target)
+        try: db.backup(destination)
+        finally: destination.close()
+    return {"created":True,"filename":target.name,"size_bytes":target.stat().st_size}
+
+@app.get("/api/backups")
+def list_backups():
+    folder=DB.parent/"backups"
+    if not folder.exists(): return []
+    return [{"filename":p.name,"size_bytes":p.stat().st_size} for p in sorted(folder.glob("aion-*.sqlite3"),reverse=True)]
